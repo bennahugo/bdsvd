@@ -437,7 +437,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     tt.flush()
                 log.info("\t<OK>")
         else:
-            log.info("\tSimulation of compression of scan {s} done")
+            log.info(f"\tSimulation of compression of scan {s} done")
 
 if __name__=='__main__':
     args = setup_cmdargs()
