@@ -101,6 +101,7 @@ def setup_cmdargs():
     OUTPUTFOLDER="output"
     PLOTON=True
     PLOTOVERRIDE=True
+    RANKOVERRIDE=0
 
     parser = argparse.ArgumentParser(description="BDSVD -- reference implementation for Baseline Dependent SVD-based compressor")
     parser.add_argument("VIS", type=str, help="Input database")
@@ -115,6 +116,7 @@ def setup_cmdargs():
     parser.add_argument("--PLOTOFF", dest="PLOTOFF", action="store_true", default=not PLOTON, help="Do not do verbose plots")
     parser.add_argument("--NOSKIPAUTO", dest="NOSKIPAUTO", action="store_true", help="Don't skip processing autocorrelations")
     parser.add_argument("--PLOTNOOVERRIDE", dest="PLOTNOOVERRIDE", action="store_true", default=not PLOTOVERRIDE, help="Do not override previous output")
+    parser.add_argument("--RANKOVERRIDE", "-ro", dest="RANKOVERRIDE", type=int, default=RANKOVERRIDE, help="Override compression rank 0 < n <= r on all spacings (manual simple SVD). <= 0 disables override")
 
     return parser.parse_args()
 
@@ -122,11 +124,34 @@ def diffangles(a, b):
     """ a, b in degrees """
     return (a - b + 180) % 360 - 180
 
-def reconstitute(V, L, UT):
+def reconstitute(V, L, UT, compressionrank=-1):
     """ Assumes fullmatrices=True V must be mxm UT must be nxn for a mxn decomposition """
+    L = L.copy()
+    if compressionrank <= 0 or compressionrank >= len(L):
+        pass
+    else:
+        L[compressionrank+1:] = 0.0 # truncate eigenvalues to simulate lossy effect of reduced rank reconstruction
     return np.dot(V[:, :len(L)] * L, UT)
     
-def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, OUTPUTFOLDER, PLOTON, NOSKIPAUTO):
+def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, 
+                     FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
+                     OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
+                     RANKOVERRIDE):
+    """
+        VIS - path to measurement set
+        DDID - selected DDID to compress (determines SPW to select)
+        FIELDID - selected field id to compress
+        INPUT_DATACOL - data column to use for data compression
+        FLAGVALUE - constant value to replace flagged values with for SVD purposes this must be finite
+        ANTSEL - list of selected antennas by name
+        SCANSEL - list of selected scans by index
+        CORRSEL - list of selected correlations by value as defined by Stokes.h in casacore
+        OUTPUTFOLDER - where to dump plots and other output
+        PLOTON - whether to make verbose plots
+        NOSKIPAUTO - by default skip auto correlations
+        RANKOVERRIDE - implement manual baseline-homogenous SVD rank reduction 
+                       (3.1 method 1 manual override) across all baselines
+    """
     # domain will be nrow x nchan per correlation
     with tbl(f"{VIS}::FIELD", ack=False) as t:
         fieldnames = t.getcol("NAME")
@@ -219,10 +244,14 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, FLAGVALUE, ANTSEL, SCANS
                         ci = np.where(corrtypes == c)[0][0]
                         seldata = data[selbl, :, ci].T.copy()
                         V, L, U = np.linalg.svd(seldata)
+                        fullrank = np.linalg.matrix_rank(seldata)
                         svds[bli][ReverseStokesTypes[c]] = {
                             "data": (V, L, U),
-                            "rank": np.linalg.matrix_rank(seldata),
-                            "shape": (V.shape[0], U.shape[0]) # D[chan x row] -> V[chan x row], U[chan x row]
+                            "rank": fullrank,
+                            "shape": (V.shape[0], U.shape[0]), # D[chan x row] -> V[chan x row], U[chan x row]
+                            # for now only have the manual baseline-homogenous rank reduction
+                            # BH TODO: rank finding algorithms need to be called here
+                            "reduced_rank": RANKOVERRIDE if RANKOVERRIDE > 0 else fullrank
                         }
                     p.next()
                 log.info("<OK>")
@@ -237,7 +266,12 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, FLAGVALUE, ANTSEL, SCANS
                     for c in CORRSEL:
                         ci = np.where(corrtypes == c)[0][0]
                         corrlbl = ReverseStokesTypes[c]
-                        log.info(f"\t\t{corrlbl} data rank: {svds[bli][corrlbl]['rank']}, "
+                        compressionrank = svds[bli][corrlbl]['reduced_rank']
+                        compmsg = f"compressed to {compressionrank}" \
+                            if compressionrank > 0 or compressionrank < len(L) else \
+                            f"(compression disabled)"
+                        log.info(f"\t\t{corrlbl} data rank {svds[bli][corrlbl]['rank']} "
+                                 f"{compmsg}, "
                                  f"dim {'x'.join(map(str, svds[bli][corrlbl]['shape']))}")
                         V, L, U = svds[bli][corrlbl]['data']
                         seldata = data[selbl, :, ci].T.copy()
@@ -259,7 +293,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, FLAGVALUE, ANTSEL, SCANS
                         selflag = flag[selbl, :, ci].T.copy()
                         origdata[selflag] = np.nan
                         V, L, U = svds[bli][corrlbl]['data']
-                        reconstitution = reconstitute(V, L, U)
+                        reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
                         assert reconstitution.shape == origdata.shape
                         reconstitution[selflag] = np.nan
                         if PLOTON:
@@ -322,6 +356,7 @@ if __name__=='__main__':
     PLOTON=not args.PLOTOFF
     PLOTOVERRIDE=not args.PLOTNOOVERRIDE
     NOSKIPAUTO = args.NOSKIPAUTO
+    RANKOVERRIDE = args.RANKOVERRIDE
 
     if PLOTON and os.path.exists(OUTPUTFOLDER) and not os.path.isdir(OUTPUTFOLDER):
         raise RuntimeError(f"Output path '{OUTPUTFOLDER}' exists, but is not a folder. Cannot take")
@@ -340,5 +375,6 @@ if __name__=='__main__':
                      CORRSEL,
                      OUTPUTFOLDER,
                      PLOTON,
-                     NOSKIPAUTO)
+                     NOSKIPAUTO,
+                     RANKOVERRIDE)
     
