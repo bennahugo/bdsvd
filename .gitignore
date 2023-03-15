@@ -1,2 +1,8 @@
 *.png
 *.dat
+*.tar
+*.tar.gz
+*.tgz
+*.ms
+*.last
+*.log
