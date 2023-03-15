@@ -441,6 +441,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
                             data[selbl,:,ci] = reconstitution.T # we transposed earlier
                         p.next()
+                    tt.putcol(OUTPUT_DATACOL, data)
                     tt.flush()
                 log.info("\t<OK>")
         else:
