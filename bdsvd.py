@@ -95,6 +95,7 @@ def setup_cmdargs():
     DDID=0
     FIELDID=0
     INPUT_DATACOL="DATA"
+    OUTPUT_DATACOL="COMPRESSED_DATA"
     FLAGVALUE = 0.
     ANTSEL=[]
     SCANSEL=[]
@@ -102,23 +103,59 @@ def setup_cmdargs():
     PLOTON=True
     PLOTOVERRIDE=True
     RANKOVERRIDE=0
+    SIMULATE=False
 
     parser = argparse.ArgumentParser(description="BDSVD -- reference implementation for Baseline Dependent SVD-based compressor")
     parser.add_argument("VIS", type=str, help="Input database")
     parser.add_argument("--DDID", "-di", dest="DDID", type=int, default=DDID, help="Selected DDID")
     parser.add_argument("--FIELDID", "-fi", dest="FIELDID", type=int, default=FIELDID, help="Selected Field ID (not name)")
     parser.add_argument("--INPUTCOL", "-ic", dest="INPUT_DATACOL", type=str, default=INPUT_DATACOL, help="Input data column to compress")
+    parser.add_argument("--OUTPUTCOL", "-oc", dest="OUTPUT_DATACOL", type=str, default=OUTPUT_DATACOL, help="Column to write rank-reduced data into. Will not affect set flags")
     parser.add_argument("--FLAGVALUE", dest="FLAG_VALUE_TO_USE", type=float, default=FLAGVALUE, help="Placeholder value to use for flagged data in input column")
     parser.add_argument("--SELANT", "-sa", dest="ANTSEL", type=str, nargs="*", default=ANTSEL, help="Select antenna by name. Can give multiple values or left unset to select all")
     parser.add_argument("--SELSCAN", "-ss", dest="SCANSEL", type=str, nargs="*", default=SCANSEL, help="Select scan by scan number. Can give multiple values or left unset to select all")
     parser.add_argument("--CORRSEL", "-sc", dest="CORRSEL", type=str, nargs="*", default=SCANSEL, help="Select correlations as defined in casacore Stokes.h. Can give multiple values or left unset to select all")
     parser.add_argument("--OUTPUTFOLDER", dest="OUTPUTFOLDER", type=str, default=OUTPUTFOLDER, help="Output folder to use for plots and output")
-    parser.add_argument("--PLOTOFF", dest="PLOTOFF", action="store_true", default=not PLOTON, help="Do not do verbose plots")
+    parser.add_argument("--PLOTOFF", "-po", dest="PLOTOFF", action="store_true", default=not PLOTON, help="Do not do verbose plots")
     parser.add_argument("--NOSKIPAUTO", dest="NOSKIPAUTO", action="store_true", help="Don't skip processing autocorrelations")
     parser.add_argument("--PLOTNOOVERRIDE", dest="PLOTNOOVERRIDE", action="store_true", default=not PLOTOVERRIDE, help="Do not override previous output")
+    parser.add_argument("--SIMULATE", "-sim", dest="SIMULATE", action="store_true", default=SIMULATE, help="Simulate compression filtering only - don't write back to database")
     parser.add_argument("--RANKOVERRIDE", "-ro", dest="RANKOVERRIDE", type=int, default=RANKOVERRIDE, help="Override compression rank 0 < n <= r on all spacings (manual simple SVD). <= 0 disables override")
 
     return parser.parse_args()
+
+def add_column(table, col_name, like_col="DATA", like_type=None):
+    """
+    Lifted from ratt-ru/cubical
+
+    Inserts a new column into the measurement set.
+    Args:
+        col_name (str): 
+            Name of target column.
+        like_col (str, optional): 
+            Column will be patterned on the named column.
+        like_type (str or None, optional): 
+            If set, column type will be changed.
+    Returns:
+        bool:
+            True if a new column was inserted, else False.
+    """
+
+    if col_name not in table.colnames():
+        # new column needs to be inserted -- get column description from column 'like_col'
+        desc = table.getcoldesc(like_col)
+
+        desc[str('name')] = str(col_name)
+        desc[str('comment')] = str(desc['comment'].replace(" ", "_"))  # got this from Cyril, not sure why
+        dminfo = table.getdminfo(like_col)
+        dminfo[str("NAME")] =  "{}-{}".format(dminfo["NAME"], col_name)
+
+        # if a different type is specified, insert that
+        if like_type:
+            desc[str('valueType')] = like_type
+        table.addcols(desc, dminfo)
+        return True
+    return False
 
 def diffangles(a, b):
     """ a, b in degrees """
@@ -136,7 +173,7 @@ def reconstitute(V, L, UT, compressionrank=-1):
 def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, 
                      FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
-                     RANKOVERRIDE):
+                     RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL):
     """
         VIS - path to measurement set
         DDID - selected DDID to compress (determines SPW to select)
@@ -151,6 +188,8 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
         NOSKIPAUTO - by default skip auto correlations
         RANKOVERRIDE - implement manual baseline-homogenous SVD rank reduction 
                        (3.1 method 1 manual override) across all baselines
+        SIMULATE - simulate only, don't modify database
+        OUTPUT_DATACOL - output column to write rank-reduced data into, will not affect changes to FLAG
     """
     # domain will be nrow x nchan per correlation
     with tbl(f"{VIS}::FIELD", ack=False) as t:
@@ -190,8 +229,29 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
             if not all(map(lambda s: str(s) in scans, SCANSEL)):
                 raise RuntimeError(f"Invalid selection of scans: '{','.join(map(str, SCANSEL))}'")
             log.info(f"User selected scans are: {','.join(map(str, SCANSEL))}")
-    with tbl(VIS, ack=False) as t:
-        for s in SCANSEL:
+    with tbl(VIS, ack=False, readonly=SIMULATE) as t:
+        if not SIMULATE:
+            if OUTPUT_DATACOL not in t.colnames():
+                log.info(f"Column '{OUTPUT_DATACOL}' does not exist. Adding... - do NOT interrupt!")
+                if not add_column(t, OUTPUT_DATACOL, like_col=INPUT_DATACOL):
+                    raise RuntimeError(f"Could not add column {OUTPUT_DATACOL} to database")
+                t.flush()
+                log.info(f"<OK>")
+            log.info(f"Initializing column '{OUTPUT_DATACOL}' to zeros - do NOT interrupt!")
+            for s in SCANSEL:
+                query = f"select from $t where DATA_DESC_ID=={DDID} and " \
+                        f"FIELD_ID=={FIELDID} and " \
+                        f"SCAN_NUMBER=={s} and " \
+                        f"(ANTENNA1 in [{','.join(map(str, selantind))}] and " \
+                        f" ANTENNA2 in [{','.join(map(str, selantind))}])"
+                with taql(query) as tt:
+                    data = tt.getcol(INPUT_DATACOL)
+                    data[...] = 0 # init to 0
+                    tt.putcol(OUTPUT_DATACOL, data)
+                    tt.flush()
+            log.info(f"<OK>")
+    for s in SCANSEL:
+        with tbl(VIS, ack=False, readonly=True) as t: # decomposition may take long... we want to make this interruptable
             query = f"select from $t where DATA_DESC_ID=={DDID} and " \
                     f"FIELD_ID=={FIELDID} and " \
                     f"SCAN_NUMBER=={s} and " \
@@ -213,17 +273,10 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 uniqbl = np.unique(bl)
                 log.info("\tRead data")
                 p = progress("\tDecomposing baselines", max=len(uniqbl))
-                svds = {
-                    "meta": {
-                        # columns needed for re-imaging
-                        # should be losslessly compressed
-                        "ANTENNA1": a1,
-                        "ANTENNA2": a2,
-                        "UVW": uvw,
-                        "FLAG": flag,
-                        "WEIGHT_SPECTRUM": weight
-                    }
-                }
+                svds = {}
+                #
+                # STEP 1: decompose baselines
+                #
                 for bli in uniqbl:
                     selbl = bl == bli
                     if np.sum(selbl) == 0:
@@ -255,48 +308,61 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         }
                     p.next()
                 log.info("<OK>")
+                #
+                # STEP 2: do rank filtering and gather some statistics
+                #
                 for bli in svds:
                     if bli == "meta": continue
                     selbl = bl == bli
                     bla1 = a1[selbl][0]
                     bla2 = a2[selbl][0]
                     log.info(f"\t{antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m):")
-                    PLOTON and plt.figure()
-                    plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
                     for c in CORRSEL:
                         ci = np.where(corrtypes == c)[0][0]
                         corrlbl = ReverseStokesTypes[c]
                         compressionrank = svds[bli][corrlbl]['reduced_rank']
+                        V, L, U = svds[bli][corrlbl]['data']
                         compmsg = f"compressed to {compressionrank}" \
-                            if compressionrank > 0 or compressionrank < len(L) else \
+                            if compressionrank > 0 and compressionrank < svds[bli][corrlbl]['rank'] else \
                             f"(compression disabled)"
                         log.info(f"\t\t{corrlbl} data rank {svds[bli][corrlbl]['rank']} "
                                  f"{compmsg}, "
                                  f"dim {'x'.join(map(str, svds[bli][corrlbl]['shape']))}")
-                        V, L, U = svds[bli][corrlbl]['data']
-                        seldata = data[selbl, :, ci].T.copy()
-                        selflag = flag[selbl, :, ci].T.copy()
-                        PLOTON and plt.plot(L, plotmarkers[ci % len(plotmarkers)], label=corrlbl)
-                    PLOTON and plt.legend()
-                    PLOTON and plt.yscale("log")
-                    PLOTON and plt.xlabel("Singular values")
-                    PLOTON and plt.ylabel("Weight")
-                    PLOTON and plt.title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
-                    imname = f"{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
-                    PLOTON and plt.savefig(os.path.join(OUTPUTFOLDER, imname))
-                    PLOTON and plt.close()
+                #
+                # STEP 3: decompress and make some waterfall and rank plots if wanted
+                #
+                if PLOTON:                  
+                    for bli in svds:
+                        if bli == "meta": continue
+                        selbl = bl == bli
+                        bla1 = a1[selbl][0]
+                        bla2 = a2[selbl][0]
+                        plt.figure()
+                        plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
+                        for c in CORRSEL:
+                            ci = np.where(corrtypes == c)[0][0]
+                            V, L, U = svds[bli][corrlbl]['data']
+                            plt.plot(L, plotmarkers[ci % len(plotmarkers)], label=corrlbl)
+                        plt.legend()
+                        plt.yscale("log")
+                        plt.xlabel("Singular values")
+                        plt.ylabel("Weight")
+                        plt.title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
+                        imname = f"{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
+                        plt.savefig(os.path.join(OUTPUTFOLDER, imname))
+                        plt.close()
 
-                    for c in CORRSEL:
-                        ci = np.where(corrtypes == c)[0][0]
-                        corrlbl = ReverseStokesTypes[c]
-                        origdata = data[selbl, :, ci].T.copy()
-                        selflag = flag[selbl, :, ci].T.copy()
-                        origdata[selflag] = np.nan
-                        V, L, U = svds[bli][corrlbl]['data']
-                        reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
-                        assert reconstitution.shape == origdata.shape
-                        reconstitution[selflag] = np.nan
-                        if PLOTON:
+                        for c in CORRSEL:
+                            ci = np.where(corrtypes == c)[0][0]
+                            corrlbl = ReverseStokesTypes[c]
+                            origdata = data[selbl, :, ci].T.copy()
+                            selflag = flag[selbl, :, ci].T.copy()
+                            origdata[selflag] = np.nan
+                            V, L, U = svds[bli][corrlbl]['data']
+                            reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
+                            assert reconstitution.shape == origdata.shape
+                            reconstitution[selflag] = np.nan
+                            
                             fig, axs = plt.subplots(3, figsize=(6,18))
                             imdiff = axs[0].imshow(np.abs(origdata - reconstitution), aspect='auto')
                             cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
@@ -316,11 +382,11 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             
                             fig.savefig(os.path.join(OUTPUTFOLDER, imname))
                             plt.close(fig)
-                        if PLOTON:
+                            
                             fig, axs = plt.subplots(3, figsize=(6,18))
                             imdiff = axs[0].imshow(diffangles(np.rad2deg(np.angle(origdata)), 
-                                                              np.rad2deg(np.angle(reconstitution))), 
-                                                   aspect='auto')
+                                                            np.rad2deg(np.angle(reconstitution))), 
+                                                aspect='auto')
                             cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
                             cbardiff.set_label("Phase difference [deg]")
                             axs[0].set_ylabel("Channel")
@@ -338,6 +404,40 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             
                             fig.savefig(os.path.join(OUTPUTFOLDER, imname))
                             plt.close(fig)
+        #
+        # STEP 4: finally write back decompressed values if needed
+        #
+        if not SIMULATE:
+            log.info(f"\tWriting back rank decompressed data to {OUTPUT_DATACOL}... - do NOT interrupt")
+            with tbl(VIS, ack=False, readonly=SIMULATE) as t:
+                query = f"select from $t where DATA_DESC_ID=={DDID} and " \
+                        f"FIELD_ID=={FIELDID} and " \
+                        f"SCAN_NUMBER=={s} and " \
+                        f"(ANTENNA1 in [{','.join(map(str, selantind))}] and " \
+                        f" ANTENNA2 in [{','.join(map(str, selantind))}])"
+                p = progress("\tDecompressing and writing", max=len(svds.keys()))
+                with taql(query) as tt:
+                    for bli in svds:
+                        if bli == "meta": 
+                            p.next()
+                            continue
+                        selbl = bl == bli
+                        bla1 = a1[selbl][0]
+                        bla2 = a2[selbl][0]
+                        # other ways to do this but we're just going to get the shape from data
+                        data = tt.getcol(INPUT_DATACOL)
+                        # IMPORTANT:: if correlations are unselected we treat them as a unity operation
+                        # uncompressed data is copied to those spots
+                        for c in CORRSEL:
+                            ci = np.where(corrtypes == c)[0][0]
+                            V, L, U = svds[bli][corrlbl]['data']
+                            reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
+                            data[selbl,:,ci] = reconstitution.T # we transposed earlier
+                        p.next()
+                    tt.flush()
+                log.info("\t<OK>")
+        else:
+            log.info("\tSimulation of compression of scan {s} done")
 
 if __name__=='__main__':
     args = setup_cmdargs()
@@ -357,6 +457,8 @@ if __name__=='__main__':
     PLOTOVERRIDE=not args.PLOTNOOVERRIDE
     NOSKIPAUTO = args.NOSKIPAUTO
     RANKOVERRIDE = args.RANKOVERRIDE
+    SIMULATE = args.SIMULATE
+    OUTPUT_DATACOL = args.OUTPUT_DATACOL
 
     if PLOTON and os.path.exists(OUTPUTFOLDER) and not os.path.isdir(OUTPUTFOLDER):
         raise RuntimeError(f"Output path '{OUTPUTFOLDER}' exists, but is not a folder. Cannot take")
@@ -376,5 +478,7 @@ if __name__=='__main__':
                      OUTPUTFOLDER,
                      PLOTON,
                      NOSKIPAUTO,
-                     RANKOVERRIDE)
+                     RANKOVERRIDE,
+                     SIMULATE,
+                     OUTPUT_DATACOL)
     
