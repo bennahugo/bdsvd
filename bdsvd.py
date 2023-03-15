@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import matplotlib
-#matplotlib.use("agg")
+matplotlib.use("agg")
 
 import numpy as np
 import sys
