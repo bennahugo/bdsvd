@@ -262,7 +262,6 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 data = tt.getcol(INPUT_DATACOL)
                 flag = tt.getcol("FLAG")
                 data[flag] = FLAGVALUE # set to a constant value - cannot be nan
-                uvw = tt.getcol("UVW")
                 a1 = tt.getcol("ANTENNA1")
                 a2 = tt.getcol("ANTENNA2")
                 if "WEIGHT_SPECTRUM" in tt.colnames():
@@ -338,16 +337,24 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         bla1 = a1[selbl][0]
                         bla2 = a2[selbl][0]
                         plt.figure()
+                        cutofflines = ["r", "b", "m", "g"]
                         plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
                         for c in CORRSEL:
                             ci = np.where(corrtypes == c)[0][0]
                             V, L, U = svds[bli][corrlbl]['data']
                             plt.plot(L, plotmarkers[ci % len(plotmarkers)], label=corrlbl)
-                        plt.legend()
+                            if svds[bli][corrlbl]['reduced_rank'] > 0 and \
+                                svds[bli][corrlbl]['reduced_rank'] < svds[bli][corrlbl]['rank']:
+                                plt.axvline(svds[bli][corrlbl]['reduced_rank'],
+                                            linewidth=3,
+                                            linestyle="--",
+                                            color=cutofflines[ci % len(cutofflines)],
+                                            label=f"cutoff {corrlbl}")
                         plt.yscale("log")
                         plt.xlabel("Singular values")
                         plt.ylabel("Weight")
                         plt.title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
+                        plt.legend()
                         imname = f"{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
                         plt.savefig(os.path.join(OUTPUTFOLDER, imname))
                         plt.close()
