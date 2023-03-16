@@ -169,7 +169,26 @@ def reconstitute(V, L, UT, compressionrank=-1):
     else:
         L[compressionrank+1:] = 0.0 # truncate eigenvalues to simulate lossy effect of reduced rank reconstruction
     return np.dot(V[:, :len(L)] * L, UT)
-    
+
+def compression_factor(nrow, nchan, r):
+    """
+        Eqn 14
+        One can quite easily shown that the padded left singular, eigen values and right singular
+        go from 
+        M x M + M x N + N x N to
+        M x r + r + r x N
+        after accounting for padded zeros beteen r and min(M,N) on the eigen values
+        bringing the total values to be stored to
+        r(M + N + 0.5)
+        where r is either the full rank or the reduced rank n as per paper
+        factor of 0.5 here because the singular values are real values, not complex as the left and
+        right singular values are
+        return CF, origsize, newsize
+    """
+    origsize = nrow * nchan
+    newsize = r * (nrow + nchan + 0.5)
+    return origsize / newsize, origsize, newsize
+
 def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, 
                      FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
@@ -310,23 +329,36 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 #
                 # STEP 2: do rank filtering and gather some statistics
                 #
+                origsize = np.zeros(len(CORRSEL), dtype=np.int64)
+                newsize = np.zeros(len(CORRSEL), dtype=np.int64)
                 for bli in svds:
                     if bli == "meta": continue
                     selbl = bl == bli
                     bla1 = a1[selbl][0]
                     bla2 = a2[selbl][0]
                     log.info(f"\t{antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m):")
-                    for c in CORRSEL:
+                    for cii, c in enumerate(CORRSEL):
                         ci = np.where(corrtypes == c)[0][0]
                         corrlbl = ReverseStokesTypes[c]
                         compressionrank = svds[bli][corrlbl]['reduced_rank']
                         V, L, U = svds[bli][corrlbl]['data']
-                        compmsg = f"compressed to {compressionrank}" \
+                        cf, origsize_i, newsize_i = \
+                            compression_factor(svds[bli][corrlbl]['shape'][1],
+                                               svds[bli][corrlbl]['shape'][0],
+                                               r = compressionrank)
+                        origsize[cii] += origsize_i
+                        newsize[cii] += newsize_i
+                        compmsg = f"compressed to {compressionrank} (CF {cf:.2f})" \
                             if compressionrank > 0 and compressionrank < svds[bli][corrlbl]['rank'] else \
                             f"(compression disabled)"
                         log.info(f"\t\t{corrlbl} data rank {svds[bli][corrlbl]['rank']} "
                                  f"{compmsg}, "
                                  f"dim {'x'.join(map(str, svds[bli][corrlbl]['shape']))}")
+                for cii, c in enumerate(CORRSEL):
+                    ci = np.where(corrtypes == c)[0][0]
+                    corrlbl = ReverseStokesTypes[c]
+                    corrfactor_str = f"{origsize[cii]/newsize[cii]:.3f}" if newsize[cii] > 0 else "Fully flagged"
+                    log.info(f"\tCompression factor (CF) for scan {s} {corrlbl}: {corrfactor_str}")
                 #
                 # STEP 3: decompress and make some waterfall and rank plots if wanted
                 #
@@ -341,6 +373,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
                         for c in CORRSEL:
                             ci = np.where(corrtypes == c)[0][0]
+                            corrlbl = ReverseStokesTypes[c]
                             V, L, U = svds[bli][corrlbl]['data']
                             plt.plot(L, plotmarkers[ci % len(plotmarkers)], label=corrlbl)
                             if svds[bli][corrlbl]['reduced_rank'] > 0 and \
