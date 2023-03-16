@@ -105,6 +105,9 @@ def setup_cmdargs():
     PLOTOVERRIDE=True
     RANKOVERRIDE=0
     SIMULATE=False
+    EPSILON=None
+    UPSILON=None
+    BASELINE_DEPENDENT_RANK_REDUCE=False
 
     parser = argparse.ArgumentParser(description="BDSVD -- reference implementation for Baseline Dependent SVD-based compressor")
     parser.add_argument("VIS", type=str, help="Input database")
@@ -121,7 +124,11 @@ def setup_cmdargs():
     parser.add_argument("--NOSKIPAUTO", dest="NOSKIPAUTO", action="store_true", help="Don't skip processing autocorrelations")
     parser.add_argument("--PLOTNOOVERRIDE", dest="PLOTNOOVERRIDE", action="store_true", default=not PLOTOVERRIDE, help="Do not override previous output")
     parser.add_argument("--SIMULATE", "-sim", dest="SIMULATE", action="store_true", default=SIMULATE, help="Simulate compression filtering only - don't write back to database")
-    parser.add_argument("--RANKOVERRIDE", "-ro", dest="RANKOVERRIDE", type=int, default=RANKOVERRIDE, help="Override compression rank 0 < n <= r on all spacings (manual simple SVD). <= 0 disables override")
+    parser.add_argument("--RANKOVERRIDE", "-ro", dest="RANKOVERRIDE", type=int, default=RANKOVERRIDE, help="Override compression rank 0 < n < r on all spacings (manual simple SVD). <= 0 disables override")
+    parser.add_argument("--EPSILON", "-ep", dest="EPSILON", type=float, default=EPSILON, help="Maximum threshold error to tolerate")
+    parser.add_argument("--UPSILON", "-up", dest="UPSILON", type=float, default=UPSILON, help="Minumum percentage signal to preserve")
+    parser.add_argument("--BASELINE_DEPENDENT_RANK_REDUCE", "-bd", dest="BASELINE_DEPENDENT_RANK_REDUCE", action="store_true", default=BASELINE_DEPENDENT_RANK_REDUCE, help="Enable per baseline rank reduction (BDSVD)")
+
 
     return parser.parse_args()
 
@@ -163,7 +170,10 @@ def diffangles(a, b):
     return (a - b + 180) % 360 - 180
 
 def reconstitute(V, L, UT, compressionrank=-1):
-    """ Assumes fullmatrices=True V must be mxm UT must be nxn for a mxn decomposition """
+    """ 
+        Assumes fullmatrices=True V must be mxm UT must be nxn for a mxn decomposition 
+        This is Vpq,n as per paper lingo
+    """
     L = L.copy()
     if compressionrank <= 0 or compressionrank >= len(L):
         pass
@@ -188,7 +198,66 @@ def compression_factor(nrow, nchan, r):
     """
     origsize = nrow * nchan
     newsize = r * (nrow + nchan + 0.5)
-    return origsize / newsize, origsize, newsize
+    if newsize == 0:
+        return np.inf, origsize, newsize
+    else:
+        return origsize / newsize, origsize, newsize
+
+def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
+    """
+        Interpretation of Algorithm 1
+        svds dico have V, L, UT which is the paper's "V" decomposed at full rank already
+        V, L, UT must be full row decomposition
+        We iterate until the Frobenius norms are close enough
+        We operate on a single correlation at a time, call this multiple times for the others
+        svds is a dico with
+            - bli: baseline index keyed dicos with
+                - bllength: baseline length
+                - c: correlation label keyed dicos with keys (note label not indices)
+                    - data: V L UT SVD decomposition at full rank full column
+                    - rank: rank of L (min(M=nchan, N=nrow))
+                    - shape: shape of original data tuple(nchan, nrow)
+                    - reduced_rank: reduced rank recommendation for L to be added/modified 
+                                    by this procedure
+            - meta: special key with meta columns (future needs to reconstitute MAIN table)
+    """
+    if epsilon is None and upsilon is None:
+        raise RuntimeError("Either epsilon or upsilon must be set")
+    if epsilon is not None and upsilon is not None:
+        raise RuntimeError("Only one of epsilon or upsilon must be set")
+    
+    n = 0
+    
+    while True:
+        r = -1
+        n += 1
+        norm_diff_bl = 0
+        norm_reduced_bl = 0
+        norm_bl = 0
+        for bli in svds.keys():
+            if bli == "meta": continue
+            cid = ReverseStokesTypes[correlation_selected]
+            if cid not in svds[bli]:
+                raise RuntimeError(f"Rank finder is being run on correlation '{cid}' is not selected by user")
+            V, L, UT = svds[bli][cid]['data']
+            this_bl_r = min(V.shape[0], UT.shape[0]) 
+            r = max(r, this_bl_r) # some baselines with other channel resolution or number of rows may be in the mix
+                                  # will iterate to maximum rank
+
+            assert len(L) == this_bl_r
+            norm_diff_bl += np.sqrt(np.sum(L[n+1:this_bl_r]**2))
+            norm_reduced_bl += np.sqrt(np.sum(L[:n]**2))
+            norm_bl += np.sqrt(np.sum(L[:this_bl_r]**2))
+        
+        stop = norm_diff_bl / norm_bl < epsilon if epsilon else \
+           norm_reduced_bl / norm_bl > upsilon / 100.
+            
+        if stop:
+            for bli in svds.keys():
+                if bli == "meta": continue
+                svds[bli][cid]['reduced_rank'] = n
+            break # while
+
 
 def data_volume_calc(num_antennas,
                      num_polarisations,
@@ -279,7 +348,8 @@ def data_volume_calc(num_antennas,
 def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL, 
                      FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
-                     RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL):
+                     RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL,
+                     EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE):
     """
         VIS - path to measurement set
         DDID - selected DDID to compress (determines SPW to select)
@@ -294,8 +364,15 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
         NOSKIPAUTO - by default skip auto correlations
         RANKOVERRIDE - implement manual baseline-homogenous SVD rank reduction 
                        (3.1 method 1 manual override) across all baselines
+                       <= 0 or >= min(nchan, ncorr) to not override Algorithm 1 or 2
         SIMULATE - simulate only, don't modify database
         OUTPUT_DATACOL - output column to write rank-reduced data into, will not affect changes to FLAG
+        EPSILON - per paper, maximum threshold error
+        UPSILON - per paper, minimum percentage signal to preserve
+        BASELINE_DEPENDENT_RANK_REDUCE - use algorithm 1 or algorithm 2 to reduce rank globally or per baseline,
+                                         True to make the rank reduction baseline dependent through algorithm 2.
+                                         Has no effect if RANKOVERRIDE is in effect
+
     """
     # domain will be nrow x nchan per correlation
     with tbl(f"{VIS}::FIELD", ack=False) as t:
@@ -380,7 +457,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 p = progress("\tDecomposing baselines", max=len(uniqbl))
                 svds = {}
                 #
-                # STEP 1: decompose baselines
+                # STEP 1: decompose baselines and work out rank reductions per alg 1 or alg 2
                 #
                 for bli in uniqbl:
                     selbl = bl == bli
@@ -407,12 +484,25 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             "data": (V, L, U),
                             "rank": fullrank,
                             "shape": (V.shape[0], U.shape[0]), # D[chan x row] -> V[chan x row], U[chan x row]
-                            # for now only have the manual baseline-homogenous rank reduction
-                            # BH TODO: rank finding algorithms need to be called here
-                            "reduced_rank": RANKOVERRIDE if RANKOVERRIDE > 0 else fullrank
+                            "reduced_rank": fullrank # for now
                         }
                     p.next()
                 log.info("<OK>")
+                for c in CORRSEL:
+                    if EPSILON is not None or UPSILON is not None:
+                        if BASELINE_DEPENDENT_RANK_REDUCE:
+                            raise NotImplementedError() # TODO
+                        else:
+                            find_n_simpleSVD(svds, c, EPSILON, UPSILON)
+                    # override rank manually if set
+                    # if neither is set then no rank reduction will be undertaken
+                    for bli in svds:
+                        if bli == "meta": continue
+                        fullrank = svds[bli][ReverseStokesTypes[c]]["rank"]
+                        do_rankoverride = RANKOVERRIDE > 0 and RANKOVERRIDE < fullrank
+                        svds[bli][ReverseStokesTypes[c]]["reduced_rank"] = \
+                            svds[bli][ReverseStokesTypes[c]]["reduced_rank"] if not do_rankoverride else \
+                                RANKOVERRIDE
                 #
                 # STEP 2: do rank filtering and gather some statistics
                 #
@@ -467,7 +557,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 data_size = total_data_volume_with_data - total_data_volume
                 data_corr_size = data_size / len(CORRSEL)
                 compressed_data_size = np.sum(np.ceil(data_corr_size * (newsize / origsize)))
-                log.info(f"\tTotal new {nrows} row MAIN table meta data volume: "
+                log.info(f"\tTotal new {nrows} row MAIN table volume: "
                          f"{total_data_volume+compressed_data_size:.0f} bytes")
                 #
                 # STEP 3: decompress and make some waterfall and rank plots if wanted
@@ -610,6 +700,11 @@ if __name__=='__main__':
     RANKOVERRIDE = args.RANKOVERRIDE
     SIMULATE = args.SIMULATE
     OUTPUT_DATACOL = args.OUTPUT_DATACOL
+    EPSILON = args.EPSILON
+    UPSILON = args.UPSILON
+    BASELINE_DEPENDENT_RANK_REDUCE = args.BASELINE_DEPENDENT_RANK_REDUCE
+    if EPSILON is not None and UPSILON is not None:
+        raise RuntimeError("Only one of epsilon or upsilon must be set")
 
     if PLOTON and os.path.exists(OUTPUTFOLDER) and not os.path.isdir(OUTPUTFOLDER):
         raise RuntimeError(f"Output path '{OUTPUTFOLDER}' exists, but is not a folder. Cannot take")
@@ -631,5 +726,8 @@ if __name__=='__main__':
                      NOSKIPAUTO,
                      RANKOVERRIDE,
                      SIMULATE,
-                     OUTPUT_DATACOL)
+                     OUTPUT_DATACOL,
+                     EPSILON,
+                     UPSILON,
+                     BASELINE_DEPENDENT_RANK_REDUCE)
     
