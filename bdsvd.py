@@ -241,6 +241,7 @@ def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
                 raise RuntimeError(f"Rank finder is being run on correlation '{cid}' is not selected by user")
             V, L, UT = svds[bli][cid]['data']
             this_bl_r = min(V.shape[0], UT.shape[0]) 
+            if n >= this_bl_r: continue # bl stops contributing to the error at this point
             r = max(r, this_bl_r) # some baselines with other channel resolution or number of rows may be in the mix
                                   # will iterate to maximum rank
 
