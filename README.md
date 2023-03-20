@@ -5,4 +5,4 @@ Does rank based filtering to compress visibility data using SVD. This is a demon
 
 svd.py - shows affect of RFI, and data repacking on matrix rank for a simple fringe
 
-bdsvd.py - Does baseline dependent filtering per paper "Lossy Compression of Large-Scale Radio Interferometric Data"
+bdsvd.py - Does baseline dependent rank filtering per paper "Lossy Compression of Large-Scale Radio Interferometric Data" on data stored in MSv2 databases
