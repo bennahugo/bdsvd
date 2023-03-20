@@ -355,6 +355,40 @@ def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
                 svds[bli][cid]['reduced_rank'] = n
             break # while
 
+def find_n_bdSVD(svds, correlation_selected, epsilon=None, upsilon=None):
+    """
+        Interpretation of Algorithm 2
+        svds dico have V, L, UT which is the paper's "V" decomposed at full rank already
+        V, L, UT must be full row decomposition
+        We iterate until the Frobenius norms are close enough per baseline as opposed to simple SVD case
+        We operate on a single correlation at a time, call this multiple times for the others
+        svds is a dico as per docstring for find_n_simpleSVD
+    """
+    if epsilon is None and upsilon is None:
+        raise RuntimeError("Either epsilon or upsilon must be set")
+    if epsilon is not None and upsilon is not None:
+        raise RuntimeError("Only one of epsilon or upsilon must be set")
+    
+    for bli in svds.keys():
+        if bli == "meta": continue
+        cid = ReverseStokesTypes[correlation_selected]
+        if cid not in svds[bli]:
+                raise RuntimeError(f"Rank finder is being run on correlation '{cid}' is not selected by user")
+        n = 0
+        V, L, UT = svds[bli][cid]['data']
+        r = min(V.shape[0], UT.shape[0])
+        assert len(L) == r
+        norm_bl = np.sqrt(np.sum(L[:r]**2))
+        while True:
+            n += 1
+            norm_diff_bl = np.sqrt(np.sum(L[n+1:r]**2))
+            norm_reduced_bl = np.sqrt(np.sum(L[:n]**2))
+            
+            stop = (norm_diff_bl / norm_bl < epsilon if epsilon else \
+                    norm_reduced_bl / norm_bl > upsilon / 100.) or n > r
+            if stop:
+                break
+        svds[bli][cid]['reduced_rank'] = n
 
 def data_volume_calc(num_antennas,
                      num_polarisations,
@@ -611,7 +645,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     cid = ReverseStokesTypes[c]
                     if EPSILON is not None or UPSILON is not None:
                         if BASELINE_DEPENDENT_RANK_REDUCE:
-                            raise NotImplementedError() # TODO
+                            find_n_bdSVD(svds, c, EPSILON, UPSILON)
                         else:
                             find_n_simpleSVD(svds, c, EPSILON, UPSILON)
                     # override rank manually if set
