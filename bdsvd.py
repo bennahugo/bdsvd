@@ -797,7 +797,23 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         # uncompressed data is copied to those spots
                         for c in CORRSEL:
                             ci = np.where(corrtypes == c)[0][0]
+                            corrlbl = ReverseStokesTypes[c]
                             V, L, U = svds[bli][corrlbl]['data']
+
+                            # --- sanity check --- 
+                            # check that the full rank decompression yields the same values
+                            # truncated to size of the packed matrix
+                            reconstitution = reconstitute(V, L, U, 
+                                                          compressionrank=svds[bli][corrlbl]['rank'])
+                            outdata, outflags = unpackmat(reconstitution, 
+                                                          svds[bli][corrlbl]['flag'].T.copy(),
+                                                          flagged_value=FLAGVALUE)
+                            assert outdata.shape == data[selbl,:,ci].T.shape
+                            assert np.sum(flag[selbl,:,ci]) <= np.sum(outflags)
+                            diffsel = np.logical_not(outflags)
+                            assert all(np.abs(outdata[diffsel] - data[selbl,:,ci].T[diffsel]) < 1e-4)
+                            # --- end sanity check ---
+
                             reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
                             outdata, outflags = unpackmat(reconstitution, 
                                                           svds[bli][corrlbl]['flag'].T.copy(),
@@ -863,4 +879,4 @@ if __name__=='__main__':
                      EPSILON,
                      UPSILON,
                      BASELINE_DEPENDENT_RANK_REDUCE)
-    
+    log.info("Program ending")
