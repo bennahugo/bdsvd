@@ -102,6 +102,7 @@ def setup_cmdargs():
     SCANSEL=[]
     OUTPUTFOLDER="output"
     PLOTON=True
+    WATERFALLON=True
     PLOTOVERRIDE=True
     RANKOVERRIDE=0
     SIMULATE=False
@@ -121,6 +122,7 @@ def setup_cmdargs():
     parser.add_argument("--CORRSEL", "-sc", dest="CORRSEL", type=str, nargs="*", default=SCANSEL, help="Select correlations as defined in casacore Stokes.h. Can give multiple values or left unset to select all")
     parser.add_argument("--OUTPUTFOLDER", dest="OUTPUTFOLDER", type=str, default=OUTPUTFOLDER, help="Output folder to use for plots and output")
     parser.add_argument("--PLOTOFF", "-po", dest="PLOTOFF", action="store_true", default=not PLOTON, help="Do not do verbose plots")
+    parser.add_argument("--WATERFALLOFF", "-wo", dest="WATERFALLOFF", action="store_true", default=not WATERFALLON, help="Skip waterfall plots, has no effect when specified PLOTOFF")
     parser.add_argument("--NOSKIPAUTO", dest="NOSKIPAUTO", action="store_true", help="Don't skip processing autocorrelations")
     parser.add_argument("--PLOTNOOVERRIDE", dest="PLOTNOOVERRIDE", action="store_true", default=not PLOTOVERRIDE, help="Do not override previous output")
     parser.add_argument("--SIMULATE", "-sim", dest="SIMULATE", action="store_true", default=SIMULATE, help="Simulate compression filtering only - don't write back to database")
@@ -128,7 +130,7 @@ def setup_cmdargs():
     parser.add_argument("--EPSILON", "-ep", dest="EPSILON", type=float, default=EPSILON, help="Maximum threshold error to tolerate")
     parser.add_argument("--UPSILON", "-up", dest="UPSILON", type=float, default=UPSILON, help="Minumum percentage signal to preserve")
     parser.add_argument("--BASELINE_DEPENDENT_RANK_REDUCE", "-bd", dest="BASELINE_DEPENDENT_RANK_REDUCE", action="store_true", default=BASELINE_DEPENDENT_RANK_REDUCE, help="Enable per baseline rank reduction (BDSVD)")
-
+    
 
     return parser.parse_args()
 
@@ -444,7 +446,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                      FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
                      RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL,
-                     EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE):
+                     EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE, WATERFALLON):
     """
         VIS - path to measurement set
         DDID - selected DDID to compress (determines SPW to select)
@@ -467,6 +469,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
         BASELINE_DEPENDENT_RANK_REDUCE - use algorithm 1 or algorithm 2 to reduce rank globally or per baseline,
                                          True to make the rank reduction baseline dependent through algorithm 2.
                                          Has no effect if RANKOVERRIDE is in effect
+        WATERFALLON - make diff waterfall plots as well when PLOTON is specified
 
     """
     # domain will be nrow x nchan per correlation
@@ -605,6 +608,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     p.next()
                 log.info("<OK>")
                 for c in CORRSEL:
+                    cid = ReverseStokesTypes[c]
                     if EPSILON is not None or UPSILON is not None:
                         if BASELINE_DEPENDENT_RANK_REDUCE:
                             raise NotImplementedError() # TODO
@@ -614,11 +618,18 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     # if neither is set then no rank reduction will be undertaken
                     for bli in svds:
                         if bli == "meta": continue
-                        fullrank = svds[bli][ReverseStokesTypes[c]]["rank"]
+                        fullrank = svds[bli][cid]["rank"]
                         do_rankoverride = RANKOVERRIDE > 0 and RANKOVERRIDE < fullrank
-                        svds[bli][ReverseStokesTypes[c]]["reduced_rank"] = \
-                            svds[bli][ReverseStokesTypes[c]]["reduced_rank"] if not do_rankoverride else \
+                        svds[bli][cid]["reduced_rank"] = \
+                            svds[bli][cid]["reduced_rank"] if not do_rankoverride else \
                                 RANKOVERRIDE
+                        
+                        # compute norm Vpq,r - Vpq,n to indicate selected error level on this spacing
+                        n = svds[bli][cid]['reduced_rank']
+                        r = svds[bli][cid]['rank']
+                        V, L, UT = svds[bli][cid]['data']
+                        this_bl_r = min(V.shape[0], UT.shape[0]) 
+                        svds[bli][cid]['rank_diff_norm'] = np.sqrt(np.sum(L[n+1:this_bl_r]**2))
                 #
                 # STEP 2: do rank filtering and gather some statistics
                 #
@@ -648,7 +659,8 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             f"(compression disabled)"
                         log.info(f"\t\t{corrlbl} data rank {svds[bli][corrlbl]['rank']} "
                                  f"{compmsg}, "
-                                 f"dim {'x'.join(map(str, svds[bli][corrlbl]['shape']))}")
+                                 f"dim {'x'.join(map(str, svds[bli][corrlbl]['shape']))} "
+                                 f"decompression error {svds[bli][corrlbl].get('rank_diff_norm', 0.):.2f}")
                 for cii, c in enumerate(CORRSEL):
                     ci = np.where(corrtypes == c)[0][0]
                     corrlbl = ReverseStokesTypes[c]
@@ -679,7 +691,30 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 # STEP 3: decompress and make some waterfall and rank plots if wanted
                 #
                 if PLOTON:
-                    p = progress("\tCreating plots", max=len(uniqbl))               
+                    p = progress("\tCreating plots", max=len(uniqbl)*2)
+                    bllengths = []
+                    blnorms = {}
+                    for bli in svds:
+                        if bli == "meta": 
+                            p.next()
+                            continue
+                        bllengths.append(svds[bli]['bllength'])
+                        for c in CORRSEL:
+                            ci = np.where(corrtypes == c)[0][0]
+                            corrlbl = ReverseStokesTypes[c]
+                            blnorms.setdefault(corrlbl, []).append(svds[bli][corrlbl]['rank_diff_norm'])
+                        p.next()
+                    plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
+                    plt.figure()
+                    for ci, c in enumerate(blnorms.keys()):
+                        plt.plot(bllengths, blnorms[c], plotmarkers[ci % len(plotmarkers)], label=c)
+                    plt.xlabel("Baseline length")
+                    plt.ylabel("$||\mathbf{V}_{pq,r} - \mathbf{V}_{pq,n}||_F$")
+                    plt.title("Decompresion error vs. baseline length")
+                    plt.legend()
+                    imname = f"norm.vs.bllength.{VIS}.scan.{s}.png"
+                    plt.savefig(os.path.join(OUTPUTFOLDER, imname))
+                    plt.close()
                     for bli in svds:
                         if bli == "meta": 
                             p.next()
@@ -689,7 +724,6 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         bla2 = a2[selbl][0]
                         plt.figure()
                         cutofflines = ["r", "b", "m", "g"]
-                        plotmarkers = ['xr', '.b', 'dm', '*g'] # up to four supported
                         for c in CORRSEL:
                             ci = np.where(corrtypes == c)[0][0]
                             corrlbl = ReverseStokesTypes[c]
@@ -710,63 +744,63 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         imname = f"{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
                         plt.savefig(os.path.join(OUTPUTFOLDER, imname))
                         plt.close()
-
-                        for c in CORRSEL:
-                            ci = np.where(corrtypes == c)[0][0]
-                            corrlbl = ReverseStokesTypes[c]
-                            origdata = data[selbl, :, ci].T.copy()
-                            origflag = flag[selbl, :, ci].T.copy()
-                            V, L, U = svds[bli][corrlbl]['data']
-                            reconstitution = reconstitute(V, L, U, 
-                                                          compressionrank=svds[bli][corrlbl]['reduced_rank'])
-                            outdata, outflags = unpackmat(reconstitution, 
-                                                          svds[bli][corrlbl]['flag'].T.copy(),
-                                                          flagged_value=FLAGVALUE)
-                            
-                            origdata[origflag] = np.nan
-                            outdata[outflags] = np.nan
-                            
-                            fig, axs = plt.subplots(3, figsize=(6,18))
-                            imdiff = axs[0].imshow(np.abs(origdata - outdata), aspect='auto')
-                            cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
-                            cbardiff.set_label("Abs difference")
-                            axs[0].set_ylabel("Channel")
-                            axs[0].set_title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
-                            imorig = axs[1].imshow(np.abs(origdata), aspect='auto')
-                            cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
-                            cbardiff.set_label("Original data")
-                            axs[1].set_ylabel("Channel")
-                            imrecon = axs[2].imshow(np.abs(outdata), aspect='auto')
-                            cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
-                            cbardiff.set_label("Reconstructed data")
-                            axs[2].set_ylabel("Channel")
-                            axs[2].set_xlabel("Sample")
-                            imname = f"reconstructed.{corrlbl}.amp.{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
-                            
-                            fig.savefig(os.path.join(OUTPUTFOLDER, imname))
-                            plt.close(fig)
-                            
-                            fig, axs = plt.subplots(3, figsize=(6,18))
-                            imdiff = axs[0].imshow(diffangles(np.rad2deg(np.angle(origdata)), 
-                                                              np.rad2deg(np.angle(outdata))), 
-                                                aspect='auto')
-                            cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
-                            cbardiff.set_label("Phase difference [deg]")
-                            axs[0].set_ylabel("Channel")
-                            axs[0].set_title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
-                            imorig = axs[1].imshow(np.rad2deg(np.angle(origdata)), aspect='auto')
-                            cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
-                            cbardiff.set_label("Original data [deg]")
-                            axs[1].set_ylabel("Channel")
-                            imrecon = axs[2].imshow(np.rad2deg(np.angle(outdata)), aspect='auto')
-                            cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
-                            cbardiff.set_label("Reconstructed data [deg]")
-                            axs[2].set_ylabel("Channel")
-                            axs[2].set_xlabel("Sample")
-                            imname = f"reconstructed.{corrlbl}.phase.{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
-                            
-                            fig.savefig(os.path.join(OUTPUTFOLDER, imname))
-                            plt.close(fig)
+                        if WATERFALLON:
+                            for c in CORRSEL:
+                                ci = np.where(corrtypes == c)[0][0]
+                                corrlbl = ReverseStokesTypes[c]
+                                origdata = data[selbl, :, ci].T.copy()
+                                origflag = flag[selbl, :, ci].T.copy()
+                                V, L, U = svds[bli][corrlbl]['data']
+                                reconstitution = reconstitute(V, L, U, 
+                                                            compressionrank=svds[bli][corrlbl]['reduced_rank'])
+                                outdata, outflags = unpackmat(reconstitution, 
+                                                            svds[bli][corrlbl]['flag'].T.copy(),
+                                                            flagged_value=FLAGVALUE)
+                                
+                                origdata[origflag] = np.nan
+                                outdata[outflags] = np.nan
+                                
+                                fig, axs = plt.subplots(3, figsize=(6,18))
+                                imdiff = axs[0].imshow(np.abs(origdata - outdata), aspect='auto')
+                                cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
+                                cbardiff.set_label("Abs difference")
+                                axs[0].set_ylabel("Channel")
+                                axs[0].set_title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
+                                imorig = axs[1].imshow(np.abs(origdata), aspect='auto')
+                                cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
+                                cbardiff.set_label("Original data")
+                                axs[1].set_ylabel("Channel")
+                                imrecon = axs[2].imshow(np.abs(outdata), aspect='auto')
+                                cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
+                                cbardiff.set_label("Reconstructed data")
+                                axs[2].set_ylabel("Channel")
+                                axs[2].set_xlabel("Sample")
+                                imname = f"reconstructed.{corrlbl}.amp.{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
+                                
+                                fig.savefig(os.path.join(OUTPUTFOLDER, imname))
+                                plt.close(fig)
+                                
+                                fig, axs = plt.subplots(3, figsize=(6,18))
+                                imdiff = axs[0].imshow(diffangles(np.rad2deg(np.angle(origdata)), 
+                                                                np.rad2deg(np.angle(outdata))), 
+                                                    aspect='auto')
+                                cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
+                                cbardiff.set_label("Phase difference [deg]")
+                                axs[0].set_ylabel("Channel")
+                                axs[0].set_title(f"Scan {s} bl {antnames[bla1]}&{antnames[bla2]} ({svds[bli]['bllength']:.2f} m)")
+                                imorig = axs[1].imshow(np.rad2deg(np.angle(origdata)), aspect='auto')
+                                cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
+                                cbardiff.set_label("Original data [deg]")
+                                axs[1].set_ylabel("Channel")
+                                imrecon = axs[2].imshow(np.rad2deg(np.angle(outdata)), aspect='auto')
+                                cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
+                                cbardiff.set_label("Reconstructed data [deg]")
+                                axs[2].set_ylabel("Channel")
+                                axs[2].set_xlabel("Sample")
+                                imname = f"reconstructed.{corrlbl}.phase.{VIS}.scan.{s}.bl.{antnames[bla1]}&{antnames[bla2]}.png"
+                                
+                                fig.savefig(os.path.join(OUTPUTFOLDER, imname))
+                                plt.close(fig)
                         p.next()
                     log.info("<OK>")
 
@@ -844,6 +878,7 @@ if __name__=='__main__':
     CORRSEL=list(map(lambda c: StokesTypes.get(c, "INVALID"), args.CORRSEL))
     OUTPUTFOLDER=args.OUTPUTFOLDER
     PLOTON=not args.PLOTOFF
+    WATERFALLON=not args.WATERFALLOFF
     PLOTOVERRIDE=not args.PLOTNOOVERRIDE
     NOSKIPAUTO = args.NOSKIPAUTO
     RANKOVERRIDE = args.RANKOVERRIDE
@@ -878,5 +913,6 @@ if __name__=='__main__':
                      OUTPUT_DATACOL,
                      EPSILON,
                      UPSILON,
-                     BASELINE_DEPENDENT_RANK_REDUCE)
+                     BASELINE_DEPENDENT_RANK_REDUCE,
+                     WATERFALLON)
     log.info("Program ending")
