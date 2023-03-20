@@ -109,6 +109,7 @@ def setup_cmdargs():
     EPSILON=None
     UPSILON=None
     BASELINE_DEPENDENT_RANK_REDUCE=False
+    CHECK_TOLERANCE=1e-4
 
     parser = argparse.ArgumentParser(description="BDSVD -- reference implementation for Baseline Dependent SVD-based compressor")
     parser.add_argument("VIS", type=str, help="Input database")
@@ -127,6 +128,7 @@ def setup_cmdargs():
     parser.add_argument("--PLOTNOOVERRIDE", dest="PLOTNOOVERRIDE", action="store_true", default=not PLOTOVERRIDE, help="Do not override previous output")
     parser.add_argument("--SIMULATE", "-sim", dest="SIMULATE", action="store_true", default=SIMULATE, help="Simulate compression filtering only - don't write back to database")
     parser.add_argument("--RANKOVERRIDE", "-ro", dest="RANKOVERRIDE", type=int, default=RANKOVERRIDE, help="Override compression rank 0 < n < r on all spacings (manual simple SVD). <= 0 disables override")
+    parser.add_argument("--CHECKTOL", dest="CHECKTOL", type=float, default=CHECK_TOLERANCE, help="Accepted numerical tolerance per visibility full rank reconstruction")
     parser.add_argument("--EPSILON", "-ep", dest="EPSILON", type=float, default=EPSILON, help="Maximum threshold error to tolerate")
     parser.add_argument("--UPSILON", "-up", dest="UPSILON", type=float, default=UPSILON, help="Minumum percentage signal to preserve")
     parser.add_argument("--BASELINE_DEPENDENT_RANK_REDUCE", "-bd", dest="BASELINE_DEPENDENT_RANK_REDUCE", action="store_true", default=BASELINE_DEPENDENT_RANK_REDUCE, help="Enable per baseline rank reduction (BDSVD)")
@@ -480,7 +482,8 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                      FLAGVALUE, ANTSEL, SCANSEL, CORRSEL, 
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
                      RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL,
-                     EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE, WATERFALLON):
+                     EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE,
+                     WATERFALLON, CHECKTOL):
     """
         VIS - path to measurement set
         DDID - selected DDID to compress (determines SPW to select)
@@ -504,7 +507,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                                          True to make the rank reduction baseline dependent through algorithm 2.
                                          Has no effect if RANKOVERRIDE is in effect
         WATERFALLON - make diff waterfall plots as well when PLOTON is specified
-
+        CHECKTOL - accepted per visibility numercal tolerance for full rank reconstruction
     """
     # domain will be nrow x nchan per correlation
     with tbl(f"{VIS}::FIELD", ack=False) as t:
@@ -628,7 +631,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         assert outdata.shape == seldata.shape
                         assert np.sum(selflag) <= np.sum(outflags)
                         diffsel = np.logical_not(outflags)
-                        assert all(np.abs(outdata[diffsel] - seldata[diffsel]) < 1e-4)
+                        assert all(np.abs(outdata[diffsel] - seldata[diffsel]) < CHECKTOL)
                         # --- end sanity check --- 
 
                         svds[bli][corrlbl] = {
@@ -742,8 +745,9 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     plt.figure()
                     for ci, c in enumerate(blnorms.keys()):
                         plt.plot(bllengths, blnorms[c], plotmarkers[ci % len(plotmarkers)], label=c)
-                    plt.xlabel("Baseline length")
+                    plt.xlabel("Baseline length [m]")
                     plt.ylabel("$||\mathbf{V}_{pq,r} - \mathbf{V}_{pq,n}||_F$")
+                    plt.xscale("log")
                     plt.title("Decompresion error vs. baseline length")
                     plt.legend()
                     imname = f"norm.vs.bllength.{VIS}.scan.{s}.png"
@@ -879,7 +883,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             assert outdata.shape == data[selbl,:,ci].T.shape
                             assert np.sum(flag[selbl,:,ci]) <= np.sum(outflags)
                             diffsel = np.logical_not(outflags)
-                            assert all(np.abs(outdata[diffsel] - data[selbl,:,ci].T[diffsel]) < 1e-4)
+                            assert all(np.abs(outdata[diffsel] - data[selbl,:,ci].T[diffsel]) < CHECKTOL)
                             # --- end sanity check ---
 
                             reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
@@ -921,6 +925,7 @@ if __name__=='__main__':
     EPSILON = args.EPSILON
     UPSILON = args.UPSILON
     BASELINE_DEPENDENT_RANK_REDUCE = args.BASELINE_DEPENDENT_RANK_REDUCE
+    CHECKTOL = args.CHECKTOL
     if EPSILON is not None and UPSILON is not None:
         raise RuntimeError("Only one of epsilon or upsilon must be set")
 
@@ -948,5 +953,6 @@ if __name__=='__main__':
                      EPSILON,
                      UPSILON,
                      BASELINE_DEPENDENT_RANK_REDUCE,
-                     WATERFALLON)
+                     WATERFALLON,
+                     CHECKTOL)
     log.info("Program ending")
