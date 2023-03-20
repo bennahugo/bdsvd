@@ -114,8 +114,8 @@ def setup_cmdargs():
     parser.add_argument("--DDID", "-di", dest="DDID", type=int, default=DDID, help="Selected DDID")
     parser.add_argument("--FIELDID", "-fi", dest="FIELDID", type=int, default=FIELDID, help="Selected Field ID (not name)")
     parser.add_argument("--INPUTCOL", "-ic", dest="INPUT_DATACOL", type=str, default=INPUT_DATACOL, help="Input data column to compress")
-    parser.add_argument("--OUTPUTCOL", "-oc", dest="OUTPUT_DATACOL", type=str, default=OUTPUT_DATACOL, help="Column to write rank-reduced data into. Will not affect set flags")
-    parser.add_argument("--FLAGVALUE", dest="FLAG_VALUE_TO_USE", type=float, default=FLAGVALUE, help="Placeholder value to use for flagged data in input column")
+    parser.add_argument("--OUTPUTCOL", "-oc", dest="OUTPUT_DATACOL", type=str, default=OUTPUT_DATACOL, help="Column to write rank-reduced data into")
+    parser.add_argument("--FLAGVALUE", dest="FLAG_VALUE_TO_USE", type=float, default=FLAGVALUE, help="Placeholder value to use for flagged data in decompressed column")
     parser.add_argument("--SELANT", "-sa", dest="ANTSEL", type=str, nargs="*", default=ANTSEL, help="Select antenna by name. Can give multiple values or left unset to select all")
     parser.add_argument("--SELSCAN", "-ss", dest="SCANSEL", type=str, nargs="*", default=SCANSEL, help="Select scan by scan number. Can give multiple values or left unset to select all")
     parser.add_argument("--CORRSEL", "-sc", dest="CORRSEL", type=str, nargs="*", default=SCANSEL, help="Select correlations as defined in casacore Stokes.h. Can give multiple values or left unset to select all")
@@ -203,6 +203,98 @@ def compression_factor(nrow, nchan, r):
     else:
         return origsize / newsize, origsize, newsize
 
+def packmat(X, Xflagged, policy="square"):
+    """
+        Repacks input matrix X of shape M x N
+        into semi-square matrix with flagged values removed
+        as given by Xflagged of shape M x N
+
+        policy can be the following:
+            "square": attempt to pack into a squareish matrix
+            "samecol": pack into a matrix with the same number
+                       of columns as X
+            "colminofcolrow": pack into a matrix with the column
+                              size the minimum of the M and N
+
+        This procedure does not change the in-memory orderinging
+        of the elements, but will removed flagged values
+
+        IMPORTANT: This procedure will remove partially filled rows,
+                   some elements at the end of the ravel may be lost 
+                   upon unpacking!
+
+        returns shape of packed matrix, packed_matrix
+    """
+    if X.shape != Xflagged.shape:
+        raise ValueError("Xflagged must be of same shape as X")
+    if Xflagged.dtype != bool:
+        raise ValueError("Xflagged must be boolean matrix")
+    if X.ndim != 2:
+        raise ValueError("X must be 2D matrix")
+    if policy not in ["square", "samecol", "colminofcolrow"]:
+        raise ValueError(f"Unknown repacking policy {policy}")
+
+    raveled = X[np.logical_not(Xflagged)].ravel()
+    
+    if policy == "square":
+        ncol = int(np.ceil(np.sqrt(raveled.size)))
+        nrow = ncol # initial guess - will refine lower down
+    elif policy == "samecol":
+        ncol = X.shape[1]
+        nrow = X.shape[0]
+    elif policy == "colminofcolrow":
+        ncol = min(X.shape[0], X.shape[1])
+        nrow = max(X.shape[0], X.shape[1])
+
+    assert ncol*nrow >= raveled.size
+    nmissing = ncol*nrow - raveled.size
+    nrow = nrow - (nmissing // ncol + (nmissing % ncol > 0)) if ncol > 0 else 0
+    truncX = np.zeros((nrow, ncol), dtype=X.dtype).ravel()
+    assert truncX.size <= raveled.size
+    truncX[...] = raveled[:truncX.size]
+    return (nrow, ncol), truncX.reshape(nrow, ncol)
+
+def unpackmat(Xpacked, origXflags, flagged_value=0.0):
+    """
+        Unpacks a matrix packed by packmat routine
+        Xpacked is a packed matrix P x Q
+        origXflags is the flag array of shape M x N
+        Note: P * Q <= M * N guarranteed by packmat routine
+        Note: some values at the end of the the P * Q
+        block may have been truncated by the packmat routine
+
+        Returns flag array of shape M x N with additional flags 
+        at the end of the array flagged array set where values
+        were truncated by packmat routine and the unpacked data
+        array of shape M x N
+    """
+
+    if Xpacked.ndim != 2:
+        raise ValueError("Xpacked must be 2D matrix")
+    if origXflags.ndim != 2:
+        raise ValueError("origXflags must be 2D matrix")
+    if Xpacked.size > origXflags.size:
+        raise ValueError("Packed size exceeds requested unpacking size")
+    if origXflags.dtype != bool:
+        raise ValueError("origXflags must be boolean matrix")
+
+    outflags = origXflags.copy()
+    outdata = np.ones(outflags.shape, dtype=Xpacked.dtype) * flagged_value
+    # packed array guarranteed to be equal or less in size
+    # meaning we need to flag unflagged values from the end of the flag memory block
+    # lost in the packing process
+    nmissing = np.sum(np.logical_not(origXflags)) - Xpacked.size
+    if nmissing < 0:
+        raise ValueError("Expected Xpacked array to be smaller or equal in size to the original flags")
+    selmissing =  np.argwhere(np.logical_not(outflags.ravel()))[::-1][:nmissing]
+    outflags.reshape(outflags.size)[selmissing] = True
+        
+    selout = np.logical_not(outflags)
+    assert Xpacked.size == np.sum(selout)
+    outdata[selout] = Xpacked.ravel() 
+
+    return outdata, outflags
+
 def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
     """
         Interpretation of Algorithm 1
@@ -215,8 +307,10 @@ def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
                 - bllength: baseline length
                 - c: correlation label keyed dicos with keys (note label not indices)
                     - data: V L UT SVD decomposition at full rank full column
+                    - flag: original flags
                     - rank: rank of L (min(M=nchan, N=nrow))
-                    - shape: shape of original data tuple(nchan, nrow)
+                    - shape: shape of packed data tuple(truncated_row, nchan)
+                    - origshape: shape of the original data (same as uncompressed flag)
                     - reduced_rank: reduced rank recommendation for L to be added/modified 
                                     by this procedure
             - meta: special key with meta columns (future needs to reconstitute MAIN table)
@@ -250,8 +344,8 @@ def find_n_simpleSVD(svds, correlation_selected, epsilon=None, upsilon=None):
             norm_reduced_bl += np.sqrt(np.sum(L[:n]**2))
             norm_bl += np.sqrt(np.sum(L[:this_bl_r]**2))
         
-        stop = norm_diff_bl / norm_bl < epsilon if epsilon else \
-           norm_reduced_bl / norm_bl > upsilon / 100.
+        stop = (norm_diff_bl / norm_bl < epsilon if epsilon else \
+                norm_reduced_bl / norm_bl > upsilon / 100.) or n > r
             
         if stop:
             for bli in svds.keys():
@@ -356,7 +450,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
         DDID - selected DDID to compress (determines SPW to select)
         FIELDID - selected field id to compress
         INPUT_DATACOL - data column to use for data compression
-        FLAGVALUE - constant value to replace flagged values with for SVD purposes this must be finite
+        FLAGVALUE - constant value to replace flagged values with
         ANTSEL - list of selected antennas by name
         SCANSEL - list of selected scans by index
         CORRSEL - list of selected correlations by value as defined by Stokes.h in casacore
@@ -367,7 +461,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                        (3.1 method 1 manual override) across all baselines
                        <= 0 or >= min(nchan, ncorr) to not override Algorithm 1 or 2
         SIMULATE - simulate only, don't modify database
-        OUTPUT_DATACOL - output column to write rank-reduced data into, will not affect changes to FLAG
+        OUTPUT_DATACOL - output column to write rank-reduced data into
         EPSILON - per paper, maximum threshold error
         UPSILON - per paper, minimum percentage signal to preserve
         BASELINE_DEPENDENT_RANK_REDUCE - use algorithm 1 or algorithm 2 to reduce rank globally or per baseline,
@@ -445,7 +539,6 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 log.info(f"Processing scan {s}. Selecting {tt.nrows()} rows from '{INPUT_DATACOL}' column")
                 data = tt.getcol(INPUT_DATACOL)
                 flag = tt.getcol("FLAG")
-                data[flag] = FLAGVALUE # set to a constant value - cannot be nan
                 a1 = tt.getcol("ANTENNA1")
                 a2 = tt.getcol("ANTENNA2")
                 if "WEIGHT_SPECTRUM" in tt.colnames():
@@ -478,14 +571,36 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                     }
                     for c in CORRSEL:
                         ci = np.where(corrtypes == c)[0][0]
+                        corrlbl = ReverseStokesTypes[c]
                         seldata = data[selbl, :, ci].T.copy()
-                        V, L, U = np.linalg.svd(seldata)
-                        fullrank = np.linalg.matrix_rank(seldata)
-                        svds[bli][ReverseStokesTypes[c]] = {
+                        selflag = flag[selbl, :, ci].T.copy()
+                        # we have to remove the flagged data from the mix on this
+                        # before taking SVD. We will be truncating rows if needed
+                        _, packeddata = packmat(seldata, selflag, policy="samecol")
+                        fullrank = np.linalg.matrix_rank(packeddata)
+                        V, L, U = np.linalg.svd(packeddata, full_matrices=True)
+                        
+                        # --- sanity check --- 
+                        # check that the full rank decompression yields the same values
+                        # truncated to size of the packed matrix
+                        reconstitution = reconstitute(V, L, U, 
+                                                      compressionrank=fullrank)
+                        outdata, outflags = unpackmat(reconstitution, 
+                                                      selflag,
+                                                      flagged_value=FLAGVALUE)
+                        assert outdata.shape == seldata.shape
+                        assert np.sum(selflag) <= np.sum(outflags)
+                        diffsel = np.logical_not(outflags)
+                        assert all(np.abs(outdata[diffsel] - seldata[diffsel]) < 1e-4)
+                        # --- end sanity check --- 
+
+                        svds[bli][corrlbl] = {
                             "data": (V, L, U),
+                            "flag": selflag.T.copy(),
                             "rank": fullrank,
-                            "shape": (V.shape[0], U.shape[0]), # D[chan x row] -> V[chan x row], U[chan x row]
-                            "reduced_rank": fullrank # for now
+                            "shape": (U.shape[0], V.shape[0]), # D[row x chan] -> V[row x chan], U[row x chan]
+                            "origshape": selflag.T.shape,
+                            "reduced_rank": fullrank, # for now
                         }
                     p.next()
                 log.info("<OK>")
@@ -523,8 +638,8 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         compressionrank = svds[bli][corrlbl]['reduced_rank']
                         V, L, U = svds[bli][corrlbl]['data']
                         cf, origsize_i, newsize_i = \
-                            compression_factor(svds[bli][corrlbl]['shape'][1],
-                                               svds[bli][corrlbl]['shape'][0],
+                            compression_factor(svds[bli][corrlbl]['shape'][0],
+                                               svds[bli][corrlbl]['shape'][1],
                                                r = compressionrank)
                         origsize[cii] += origsize_i
                         newsize[cii] += newsize_i
@@ -543,7 +658,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                                                         num_polarisations=len(CORRSEL),
                                                         total_obs_hrs=0, #ignored nrow given
                                                         dump_rate=0, #ignored nrow given
-                                                        num_channels=svds[bli][corrlbl]['shape'][0],
+                                                        num_channels=svds[bli][corrlbl]['shape'][1],
                                                         auto_correlations=NOSKIPAUTO,
                                                         nrows=nrows,
                                                         num_data_cols=0) # not storing a DATA column
@@ -551,7 +666,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                                                                num_polarisations=len(CORRSEL),
                                                                total_obs_hrs=0, #ignored nrow given
                                                                dump_rate=0, #ignored nrow given
-                                                               num_channels=svds[bli][corrlbl]['shape'][0],
+                                                               num_channels=svds[bli][corrlbl]['shape'][1],
                                                                auto_correlations=NOSKIPAUTO,
                                                                nrows=nrows,
                                                                num_data_cols=1) # not storing a DATA column
@@ -563,9 +678,12 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 #
                 # STEP 3: decompress and make some waterfall and rank plots if wanted
                 #
-                if PLOTON:                  
+                if PLOTON:
+                    p = progress("\tCreating plots", max=len(uniqbl))               
                     for bli in svds:
-                        if bli == "meta": continue
+                        if bli == "meta": 
+                            p.next()
+                            continue
                         selbl = bl == bli
                         bla1 = a1[selbl][0]
                         bla2 = a2[selbl][0]
@@ -597,15 +715,19 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             ci = np.where(corrtypes == c)[0][0]
                             corrlbl = ReverseStokesTypes[c]
                             origdata = data[selbl, :, ci].T.copy()
-                            selflag = flag[selbl, :, ci].T.copy()
-                            origdata[selflag] = np.nan
+                            origflag = flag[selbl, :, ci].T.copy()
                             V, L, U = svds[bli][corrlbl]['data']
-                            reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
-                            assert reconstitution.shape == origdata.shape
-                            reconstitution[selflag] = np.nan
+                            reconstitution = reconstitute(V, L, U, 
+                                                          compressionrank=svds[bli][corrlbl]['reduced_rank'])
+                            outdata, outflags = unpackmat(reconstitution, 
+                                                          svds[bli][corrlbl]['flag'].T.copy(),
+                                                          flagged_value=FLAGVALUE)
+                            
+                            origdata[origflag] = np.nan
+                            outdata[outflags] = np.nan
                             
                             fig, axs = plt.subplots(3, figsize=(6,18))
-                            imdiff = axs[0].imshow(np.abs(origdata - reconstitution), aspect='auto')
+                            imdiff = axs[0].imshow(np.abs(origdata - outdata), aspect='auto')
                             cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
                             cbardiff.set_label("Abs difference")
                             axs[0].set_ylabel("Channel")
@@ -614,7 +736,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
                             cbardiff.set_label("Original data")
                             axs[1].set_ylabel("Channel")
-                            imrecon = axs[2].imshow(np.abs(reconstitution), aspect='auto')
+                            imrecon = axs[2].imshow(np.abs(outdata), aspect='auto')
                             cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
                             cbardiff.set_label("Reconstructed data")
                             axs[2].set_ylabel("Channel")
@@ -626,7 +748,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             
                             fig, axs = plt.subplots(3, figsize=(6,18))
                             imdiff = axs[0].imshow(diffangles(np.rad2deg(np.angle(origdata)), 
-                                                            np.rad2deg(np.angle(reconstitution))), 
+                                                              np.rad2deg(np.angle(outdata))), 
                                                 aspect='auto')
                             cbardiff = fig.colorbar(imdiff, ax=axs[0], orientation='vertical')
                             cbardiff.set_label("Phase difference [deg]")
@@ -636,7 +758,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             cbardiff = fig.colorbar(imorig, ax=axs[1], orientation='vertical')
                             cbardiff.set_label("Original data [deg]")
                             axs[1].set_ylabel("Channel")
-                            imrecon = axs[2].imshow(np.rad2deg(np.angle(reconstitution)), aspect='auto')
+                            imrecon = axs[2].imshow(np.rad2deg(np.angle(outdata)), aspect='auto')
                             cbardiff = fig.colorbar(imrecon, ax=axs[2], orientation='vertical')
                             cbardiff.set_label("Reconstructed data [deg]")
                             axs[2].set_ylabel("Channel")
@@ -645,6 +767,9 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             
                             fig.savefig(os.path.join(OUTPUTFOLDER, imname))
                             plt.close(fig)
+                        p.next()
+                    log.info("<OK>")
+
         #
         # STEP 4: finally write back decompressed values if needed
         #
@@ -658,6 +783,9 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         f" ANTENNA2 in [{','.join(map(str, selantind))}])"
                 p = progress("\tDecompressing and writing", max=len(svds.keys()))
                 with taql(query) as tt:
+                    # other ways to do this but we're just going to get the shape from data
+                    data = tt.getcol(INPUT_DATACOL)
+                    flag = tt.getcol("FLAG")
                     for bli in svds:
                         if bli == "meta": 
                             p.next()
@@ -665,17 +793,21 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         selbl = bl == bli
                         bla1 = a1[selbl][0]
                         bla2 = a2[selbl][0]
-                        # other ways to do this but we're just going to get the shape from data
-                        data = tt.getcol(INPUT_DATACOL)
                         # IMPORTANT:: if correlations are unselected we treat them as a unity operation
                         # uncompressed data is copied to those spots
                         for c in CORRSEL:
                             ci = np.where(corrtypes == c)[0][0]
                             V, L, U = svds[bli][corrlbl]['data']
                             reconstitution = reconstitute(V, L, U, compressionrank=svds[bli][corrlbl]['reduced_rank'])
-                            data[selbl,:,ci] = reconstitution.T # we transposed earlier
+                            outdata, outflags = unpackmat(reconstitution, 
+                                                          svds[bli][corrlbl]['flag'].T.copy(),
+                                                          flagged_value=FLAGVALUE)
+                            outdata[outflags] = FLAGVALUE
+                            data[selbl,:,ci] = outdata.T.copy() # we transposed earlier
+                            flag[selbl,:,ci] = outflags.T.copy()
                         p.next()
                     tt.putcol(OUTPUT_DATACOL, data)
+                    tt.putcol("FLAG", flag)
                     tt.flush()
                 log.info("\t<OK>")
         else:
