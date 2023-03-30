@@ -104,12 +104,14 @@ def setup_cmdargs():
     PLOTON=True
     WATERFALLON=True
     PLOTOVERRIDE=True
+    IGNOREFLAGS=False
     RANKOVERRIDE=0
     SIMULATE=False
     EPSILON=None
     UPSILON=None
     BASELINE_DEPENDENT_RANK_REDUCE=False
     CHECK_TOLERANCE=1e-4
+    PAINTING_POLICY="WITHMODEL"
 
     parser = argparse.ArgumentParser(description="BDSVD -- reference implementation for Baseline Dependent SVD-based compressor")
     parser.add_argument("VIS", type=str, help="Input database")
@@ -132,8 +134,10 @@ def setup_cmdargs():
     parser.add_argument("--EPSILON", "-ep", dest="EPSILON", type=float, default=EPSILON, help="Maximum threshold error to tolerate")
     parser.add_argument("--UPSILON", "-up", dest="UPSILON", type=float, default=UPSILON, help="Minumum percentage signal to preserve")
     parser.add_argument("--BASELINE_DEPENDENT_RANK_REDUCE", "-bd", dest="BASELINE_DEPENDENT_RANK_REDUCE", action="store_true", default=BASELINE_DEPENDENT_RANK_REDUCE, help="Enable per baseline rank reduction (BDSVD)")
-    
-
+    parser.add_argument("--IGNOREFLAGS", "-if", dest="IGNOREFLAGS", action="store_true", default=IGNOREFLAGS, help="Ignores input flags - can only be used with option SIMULATE")
+    parser.add_argument("--INPAINTING_POLICY", "-ipp", dest="INPAINTING_POLICY", choices=["WITHMODEL", "WITHCONSTANT", "REPACK"], default=PAINTING_POLICY,
+                        help="How to deal with flagged data: inpaint it with MODEL_DATA, with constant as specified by FLAGVALUE (not recommended!) or "
+                             "repack matrices with flagged values excluded (this may affect output FLAG column) and percentages")
     return parser.parse_args()
 
 def add_column(table, col_name, like_col="DATA", like_type=None):
@@ -483,7 +487,7 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                      OUTPUTFOLDER, PLOTON, NOSKIPAUTO,
                      RANKOVERRIDE, SIMULATE, OUTPUT_DATACOL,
                      EPSILON, UPSILON, BASELINE_DEPENDENT_RANK_REDUCE,
-                     WATERFALLON, CHECKTOL):
+                     WATERFALLON, CHECKTOL, IGNOREFLAGS, PAINTING_POLICY):
     """
         VIS - path to measurement set
         DDID - selected DDID to compress (determines SPW to select)
@@ -508,6 +512,11 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                                          Has no effect if RANKOVERRIDE is in effect
         WATERFALLON - make diff waterfall plots as well when PLOTON is specified
         CHECKTOL - accepted per visibility numercal tolerance for full rank reconstruction
+        IGNOREFLAGS - Ignores input flags
+        PAINTING_POLICY - "WITHMODEL", "WITHCONSTANT" or "REPACK". How to deal with flagged data: inpaint it with 
+                         MODEL_DATA, with constant as specified by FLAGVALUE (not recommended!) or 
+                         repack matrices with flagged values excluded (this may affect output FLAG column) and 
+                         percentages
     """
     # domain will be nrow x nchan per correlation
     with tbl(f"{VIS}::FIELD", ack=False) as t:
@@ -579,6 +588,12 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                 log.info(f"Processing scan {s}. Selecting {tt.nrows()} rows from '{INPUT_DATACOL}' column")
                 data = tt.getcol(INPUT_DATACOL)
                 flag = tt.getcol("FLAG")
+                if IGNOREFLAGS and SIMULATE: # only when simulating to prevent contaminating original flags
+                    flag[...] = False
+                if PAINTING_POLICY == "WITHMODEL":
+                    model = tt.getcol("MODEL_DATA")
+                else:
+                    model = None
                 a1 = tt.getcol("ANTENNA1")
                 a2 = tt.getcol("ANTENNA2")
                 if "WEIGHT_SPECTRUM" in tt.colnames():
@@ -614,9 +629,20 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         corrlbl = ReverseStokesTypes[c]
                         seldata = data[selbl, :, ci].T.copy()
                         selflag = flag[selbl, :, ci].T.copy()
-                        # we have to remove the flagged data from the mix on this
-                        # before taking SVD. We will be truncating rows if needed
-                        _, packeddata = packmat(seldata, selflag, policy="samecol")
+                        if PAINTING_POLICY == "WITHMODEL":
+                            selmodel = model[selbl, :, ci].T.copy()
+                            seldata[selflag] = selmodel[selflag]
+                            packeddata = seldata
+                        elif PAINTING_POLICY == "WITHCONSTANT":
+                            seldata[selflag] = FLAGVALUE
+                            packeddata = seldata
+                        elif PAINTING_POLICY == "REPACK":
+                            # we have to remove the flagged data from the mix on this
+                            # before taking SVD. We will be truncating rows if needed
+                            _, packeddata = packmat(seldata, selflag, policy="samecol")
+                        else:
+                            raise ValueError(f"Illegal option '{PAINTING_POLICY}' for PAINTING_POLICY")
+                        
                         fullrank = np.linalg.matrix_rank(packeddata)
                         V, L, U = np.linalg.svd(packeddata, full_matrices=True)
                         
@@ -625,9 +651,13 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                         # truncated to size of the packed matrix
                         reconstitution = reconstitute(V, L, U, 
                                                       compressionrank=fullrank)
-                        outdata, outflags = unpackmat(reconstitution, 
-                                                      selflag,
-                                                      flagged_value=FLAGVALUE)
+                        if PAINTING_POLICY == "REPACK":
+                            outdata, outflags = unpackmat(reconstitution, 
+                                                          selflag,
+                                                          flagged_value=FLAGVALUE)
+                        else:
+                            outdata = reconstitution
+                            outflags = selflag
                         assert outdata.shape == seldata.shape
                         assert np.sum(selflag) <= np.sum(outflags)
                         diffsel = np.logical_not(outflags)
@@ -791,9 +821,14 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                                 V, L, U = svds[bli][corrlbl]['data']
                                 reconstitution = reconstitute(V, L, U, 
                                                             compressionrank=svds[bli][corrlbl]['reduced_rank'])
-                                outdata, outflags = unpackmat(reconstitution, 
-                                                            svds[bli][corrlbl]['flag'].T.copy(),
-                                                            flagged_value=FLAGVALUE)
+                                
+                                if PAINTING_POLICY == "REPACK":
+                                    outdata, outflags = unpackmat(reconstitution, 
+                                                                  svds[bli][corrlbl]['flag'].T.copy(),
+                                                                  flagged_value=FLAGVALUE)
+                                else:
+                                    outdata = reconstitution
+                                    outflags = svds[bli][corrlbl]['flag'].T.copy()
                                 
                                 origdata[origflag] = np.nan
                                 outdata[outflags] = np.nan
@@ -877,9 +912,13 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             # truncated to size of the packed matrix
                             reconstitution = reconstitute(V, L, U, 
                                                           compressionrank=svds[bli][corrlbl]['rank'])
-                            outdata, outflags = unpackmat(reconstitution, 
-                                                          svds[bli][corrlbl]['flag'].T.copy(),
-                                                          flagged_value=FLAGVALUE)
+                            if PAINTING_POLICY == "REPACK":
+                                outdata, outflags = unpackmat(reconstitution, 
+                                                              svds[bli][corrlbl]['flag'].T.copy(),
+                                                              flagged_value=FLAGVALUE)
+                            else:
+                                outdata = reconstitution
+                                outflags = svds[bli][corrlbl]['flag'].T.copy()
                             assert outdata.shape == data[selbl,:,ci].T.shape
                             assert np.sum(flag[selbl,:,ci]) <= np.sum(outflags)
                             diffsel = np.logical_not(outflags)
@@ -895,9 +934,14 @@ def compress_datacol(VIS, DDID, FIELDID, INPUT_DATACOL,
                             flag[selbl,:,ci] = outflags.T.copy()
                         p.next()
                     tt.putcol(OUTPUT_DATACOL, data)
-                    tt.putcol("FLAG", flag)
+                    if PAINTING_POLICY == "REPACK":
+                        tt.putcol("FLAG", flag)
                     tt.flush()
                 log.info("\t<OK>")
+                if PAINTING_POLICY == "REPACK":
+                    log.info("Repacked matrices. May increase flagging")
+                else:
+                    log.info("Inpainting instead of repacking. Will not touch flags")
         else:
             log.info(f"\tSimulation of compression of scan {s} done")
 
@@ -926,6 +970,8 @@ if __name__=='__main__':
     UPSILON = args.UPSILON
     BASELINE_DEPENDENT_RANK_REDUCE = args.BASELINE_DEPENDENT_RANK_REDUCE
     CHECKTOL = args.CHECKTOL
+    IGNOREFLAGS = args.IGNOREFLAGS
+    INPAINTINGPOLICY = args.INPAINTING_POLICY
     if EPSILON is not None and UPSILON is not None:
         raise RuntimeError("Only one of epsilon or upsilon must be set")
 
@@ -935,6 +981,8 @@ if __name__=='__main__':
         shutil.rmtree(OUTPUTFOLDER)
     if PLOTON and not os.path.exists(OUTPUTFOLDER):
         os.mkdir(OUTPUTFOLDER)
+    if IGNOREFLAGS and not SIMULATE:
+        raise RuntimeError("Can only specify IGNOREFLAGS when specified SIMULATE")
     
     compress_datacol(VIS,
                      DDID,
@@ -954,5 +1002,7 @@ if __name__=='__main__':
                      UPSILON,
                      BASELINE_DEPENDENT_RANK_REDUCE,
                      WATERFALLON,
-                     CHECKTOL)
+                     CHECKTOL,
+                     IGNOREFLAGS,
+                     INPAINTINGPOLICY)
     log.info("Program ending")
